@@ -56,6 +56,9 @@ class DynamicTensorSpec:
     gen_tuning_buckets: Union[Tuple[int, ...], Callable]
     map_to_tuning_buckets: Callable
     tensor_initializers: List[Callable] = field(default_factory=lambda: None)
+    _cached_hash: Optional[int] = field(
+        init=False, default=None, repr=False, compare=False
+    )
 
     def __post_init__(self):
         # Set default tensor_initializers if not provided
@@ -68,8 +71,10 @@ class DynamicTensorSpec:
             ]
 
     def __hash__(self) -> int:
-        # FIXME: currently not hasing tensor_initializers
-        return hash(
+        if self._cached_hash is not None:
+            return self._cached_hash
+        # FIXME: currently not hashing tensor_initializers
+        h = hash(
             (
                 self.input_idx,
                 self.dim_idx,
@@ -80,9 +85,11 @@ class DynamicTensorSpec:
                 id(self.map_to_tuning_buckets),
             )
         )
+        self._cached_hash = h
+        return h
 
 
-@dataclass(slots=True, unsafe_hash=True)
+@dataclass(slots=True)
 class ConstraintSpec:
     """
     A specification for a constraint on a tensor dimension.
@@ -95,9 +102,19 @@ class ConstraintSpec:
     input_idx: int
     dim_idx: int
     infer_shape: Callable
+    _cached_hash: Optional[int] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+
+    def __hash__(self) -> int:
+        if self._cached_hash is not None:
+            return self._cached_hash
+        h = hash((self.input_idx, self.dim_idx, self.infer_shape))
+        self._cached_hash = h
+        return h
 
 
-@dataclass(kw_only=True, unsafe_hash=True)
+@dataclass(kw_only=True)
 class TuningConfig:
     """Configuration for autotuning.
 
@@ -139,6 +156,16 @@ class TuningConfig:
 
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
+    _cached_hash: Optional[int] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+
+    def __hash__(self) -> int:
+        if self._cached_hash is not None:
+            return self._cached_hash
+        h = hash((self.dynamic_tensor_specs, self.constraint_specs))
+        self._cached_hash = h
+        return h
 
 
 @dataclass(unsafe_hash=True)
@@ -244,7 +271,12 @@ class TunableRunner(ABC):
         raise NotImplementedError
 
     def __hash__(self):
-        return hash(tuple(self.__dict__.values()))
+        try:
+            return self._hash_cache
+        except AttributeError:
+            h = hash(tuple(self.__dict__.values()))
+            self._hash_cache = h
+            return h
 
 
 @contextlib.contextmanager
@@ -259,6 +291,7 @@ def autotune(tune_mode: bool = True):
     finally:
         AutoTuner.get().is_tuning_mode = old_mode
         if autotune_enabled:
+            AutoTuner.get()._op_caches.clear()
             logger.info("[Autotuner]: Autotuning process ends")
 
 
@@ -332,6 +365,92 @@ def load_from_file(key):
     return False, 0, -1, None
 
 
+class _OpFastCache:
+    """Per-operation fast lookup cache for the inference hot path.
+
+    Pre-computes everything constant per call site (custom_op, runners,
+    tuning_config) and reduces the per-call lookup to:
+      1. Extract the dynamic dim value: inputs[idx].size(dim) — ~50ns
+      2. Bucket it: map_to_tuning_buckets(val) — ~50ns
+      3. Dict lookup by int key — ~30ns
+    """
+
+    __slots__ = (
+        "_fallback",
+        "_single_spec",
+        "_specs",
+        "_runner_prefixes",
+        "_local_cache",
+        "_profiling_cache",
+        "_tuning_config",
+    )
+
+    def __init__(self, custom_op, runners, tuning_config, profiling_cache):
+        self._fallback = (runners[0], -1)
+        self._profiling_cache = profiling_cache
+        self._tuning_config = tuning_config
+
+        specs = tuning_config.dynamic_tensor_specs
+        self._specs = specs
+        self._single_spec = specs[0] if len(specs) == 1 else None
+
+        # Pre-compute the constant parts of the cache key for each runner
+        op_hash = hash(custom_op)
+        self._runner_prefixes = tuple(
+            (op_hash, id(type(r)), hash(r)) for r in runners
+        )
+
+        self._local_cache: Dict[Any, Tuple[TunableRunner, int]] = {}
+
+    def lookup(self, inputs, runners):
+        """Fast inference lookup: extract dynamic dim -> bucket -> dict get."""
+        # Single dynamic spec is the overwhelmingly common case
+        single = self._single_spec
+        if single is not None:
+            dim_val = inputs[single.input_idx[0]].size(single.dim_idx[0])
+            bucket = single.map_to_tuning_buckets(dim_val)
+        elif len(self._specs) == 0:
+            bucket = 0
+        else:
+            bucket = tuple(
+                spec.map_to_tuning_buckets(
+                    inputs[spec.input_idx[0]].size(spec.dim_idx[0])
+                )
+                for spec in self._specs
+            )
+
+        result = self._local_cache.get(bucket)
+        if result is not None:
+            return result
+
+        return self._populate(bucket, inputs, runners)
+
+    def _populate(self, bucket, inputs, runners):
+        """Slow path: resolve from main profiling_cache and warm the local cache."""
+        try:
+            input_shapes = tuple(inp.size() for inp in inputs)
+        except AttributeError:
+            input_shapes = tuple(
+                inp.size() if isinstance(inp, torch.Tensor) else torch.Size((0,))
+                for inp in inputs
+            )
+
+        profile = AutoTuner._find_nearest_profile(input_shapes, self._tuning_config)
+        profile_hash = hash(profile)
+
+        for prefix in self._runner_prefixes:
+            cache_key = (*prefix, profile_hash)
+            entry = self._profiling_cache.get(cache_key)
+            if entry is not None:
+                runner_id, tactic, _stored = entry
+                result = (runners[runner_id], tactic)
+                self._local_cache[bucket] = result
+                return result
+
+        # Miss — return fallback, don't cache so future tuning results are picked up
+        return self._fallback
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -352,6 +471,10 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = {}
         self.is_tuning_mode = False
+        self._load_from_file = (
+            os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+        )
+        self._op_caches: Dict[Tuple, _OpFastCache] = {}
 
         # Add statistics tracking
         self.stats = AutoTunerStatistics()
@@ -363,6 +486,16 @@ class AutoTuner:
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
+
+    @staticmethod
+    def _fast_cache_key(op_hash, runner_type_id, runner_hash, profile_hash):
+        """Build an integer-tuple cache key from pre-computed hash components.
+
+        This is cheaper than the full _get_cache_key because:
+        - All elements are ints (fast to hash/compare in dict lookups)
+        - No string attribute access or nested tuple hashing
+        """
+        return (op_hash, runner_type_id, runner_hash, profile_hash)
 
     def search_cache(
         self,
@@ -376,24 +509,30 @@ class AutoTuner:
         Args:
             custom_op (str): The name of the custom operation to be tuned
             runners (List[TunableRunner]): List of candidate implementations to profile
-            profile (OptimizationProfile): Optimization profile
+            input_shapes: Tuple of input tensor shapes
 
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
-        for r in runners:
-            cache_key = AutoTuner._get_cache_key(
-                custom_op, r, input_shapes, tuning_config
+        # File-based lookup needs full verbose cache key (rare path)
+        if self._load_from_file and not self.is_tuning_mode:
+            cache_key = self._get_cache_key(
+                custom_op, runners[0], input_shapes, tuning_config
             )
-            if (
-                os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
-                and not self.is_tuning_mode
-            ):
-                output = load_from_file(cache_key)
-                return output
-            elif cache_key in self.profiling_cache:
-                return True, *self.profiling_cache[cache_key]
+            return load_from_file(cache_key)
+
+        # Compute profile once (not per-runner) and hash components up front
+        profile = self._find_nearest_profile(input_shapes, tuning_config)
+        op_hash = hash(custom_op)
+        profile_hash = hash(profile)
+        for r in runners:
+            cache_key = self._fast_cache_key(
+                op_hash, id(type(r)), hash(r), profile_hash
+            )
+            entry = self.profiling_cache.get(cache_key)
+            if entry is not None:
+                return True, *entry
 
         return False, 0, -1, None
 
@@ -427,27 +566,25 @@ class AutoTuner:
             Runner authors are suggested to provide a fallback implementation for each runner to avoid potential issues.
         """
 
-        input_shapes = tuple(self._get_input_sizes(inputs))
-
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
+            # Fast path: per-operation local cache bypasses _get_input_sizes entirely
+            if not self._load_from_file:
+                op_key = (custom_op, id(tuning_config))
+                fast = self._op_caches.get(op_key)
+                if fast is None:
+                    fast = _OpFastCache(
+                        custom_op, runners, tuning_config, self.profiling_cache
+                    )
+                    self._op_caches[op_key] = fast
+                return fast.lookup(inputs, runners)
+
+            # Load-from-file fallback (rare)
+            input_shapes = self._get_input_sizes(inputs)
             is_cache_hit, runner_id, tactic, stored_profile = self.search_cache(
                 custom_op, runners, input_shapes, tuning_config
             )
-            runner = runners[runner_id]
-            # TODO: check the stored runner and tactic can implement this shape here
-            # Should not directly try (runner, tactic) here, or it will hurt a lot of inference perf.
-
-            # Record the cache miss config.
-            # Expect no cache miss in inference. Thus, any cache miss should be recorded.
-            if not is_cache_hit:
-                logger.debug(
-                    f"[AutoTunner]: Using fallback tactic for {custom_op} with input shapes {input_shapes}"
-                )
-                logger.debug(
-                    f"[AutoTunner]: Generated key{AutoTuner._get_cache_key(custom_op, runners[0], input_shapes, tuning_config)}"
-                )
-            return runner, tactic
+            return runners[runner_id], tactic
 
         assert len(runners) > 0, "At least one runner is required"
         assert all([isinstance(r, TunableRunner) for r in runners]), (
@@ -520,11 +657,14 @@ class AutoTuner:
 
                     if runner_id is not None:
                         # At least one valid (runner, tactic) pair is found
-                        cache_key = AutoTuner._get_cache_key(
-                            custom_op,
-                            runners[runner_id],
-                            p.get_opt_shapes(),
-                            tuning_config,
+                        store_profile = self._find_nearest_profile(
+                            p.get_opt_shapes(), tuning_config
+                        )
+                        cache_key = self._fast_cache_key(
+                            hash(custom_op),
+                            id(type(runners[runner_id])),
+                            hash(runners[runner_id]),
+                            hash(store_profile),
                         )
                         # inspect call stack
                         self.profiling_cache[cache_key] = (runner_id, tactic, p)
@@ -544,20 +684,23 @@ class AutoTuner:
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
+        input_shapes = self._get_input_sizes(inputs)
         _, runner_id, tactic, _ = self.search_cache(
             custom_op, runners, input_shapes, tuning_config
         )
 
         return runners[runner_id], tactic
 
-    def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
-        # Handle None tensors for optional inputs and non-Tensor scalar values
-        sizes = [
-            input.size() if isinstance(input, torch.Tensor) else torch.Size((0,))
-            for input in inputs
-        ]
-
-        return sizes
+    def _get_input_sizes(self, inputs: List[torch.Tensor]) -> Tuple[torch.Size, ...]:
+        # Fast path: all inputs are tensors (common case)
+        try:
+            return tuple(inp.size() for inp in inputs)
+        except AttributeError:
+            # Fallback: handle None or non-Tensor scalar inputs
+            return tuple(
+                inp.size() if isinstance(inp, torch.Tensor) else torch.Size((0,))
+                for inp in inputs
+            )
 
     def _profile_single_kernel(
         self, runner: TunableRunner, inputs: List[torch.Tensor], tactic: int, **kwargs
@@ -802,6 +945,7 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        self._op_caches.clear()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
