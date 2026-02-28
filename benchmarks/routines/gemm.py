@@ -1070,7 +1070,11 @@ def testMmFp4(args):
         print(f"[VVERBOSE] {mat2_fp4.shape = }")
         print(f"[VVERBOSE] {mat2_fp4.dtype = }")
 
-    alpha = 1.0 / (global_sf_input * global_sf_mat2) if use_nvfp4 else None
+    alpha = (
+        1.0 / (global_sf_input * global_sf_mat2)
+        if use_nvfp4
+        else torch.tensor([1.0], dtype=torch.float32, device=device)
+    )
     # Completed preparing inputs. Now programmatically filter backends
     block_size = 16 if use_nvfp4 else 32
     backends_to_remove = []
