@@ -77,6 +77,10 @@ def _run_mm_mxfp8(
     provide_out,
 ):
     _skip_if_unsupported(backend)
+    if backend == "cute-dsl" and not is_sf_swizzled_layout:
+        pytest.skip(
+            "cute-dsl mm_mxfp8 currently supports only swizzled 1D scale layout."
+        )
 
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
