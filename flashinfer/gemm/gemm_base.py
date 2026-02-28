@@ -3148,14 +3148,12 @@ def _cute_dsl_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    # cute_dsl backend requires 128x4 scale factor layout (same as cudnn/cutlass).
+    # cute_dsl backend requires 128x4 scale factor layout.
     # The kernel internally uses CUTLASS BlockScaledBasicChunk which expects
-    # M/N padded to 128, K padded to 4 -- matching FlashInfer's nvfp4_quantize
-    # with sfLayout=SfLayout.layout_128x4 and do_shuffle=False.
+    # M/N padded to 128, K padded to 4 -- matching FlashInfer's quantization
+    # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
-    if not use_nvfp4:
-        raise ValueError("cute_dsl FP4 GEMM only supports nvfp4 quantization.")
     try:
         from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
@@ -3177,6 +3175,7 @@ def _cute_dsl_gemm_fp4_runner(
     sm_minor: int,
     enable_pdl: bool,
     out_dtype: torch.dtype,
+    use_nvfp4: bool,
 ):
     """Create a CuTe DSL FP4 GEMM runner for the cute_dsl backend.
 
@@ -3256,9 +3255,9 @@ def _cute_dsl_gemm_fp4_runner(
             n = b.shape[1]
             real_k = k_packed * 2  # FP4 packed as uint8
 
-            sf_vec_size = 16  # NVF4
+            sf_vec_size = 16 if use_nvfp4 else 32
             ab_dtype = cutlass.Float4E2M1FN
-            sf_dtype = cutlass.Float8E4M3FN
+            sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
             # SM100 tactic candidates
@@ -3422,7 +3421,8 @@ def _cute_dsl_gemm_fp4_runner(
             n = b.shape[1]
             real_k = k_packed * 2
 
-            sf_vec_size = 16
+            sf_vec_size = 16 if use_nvfp4 else 32
+            sf_dtype = cutlass.Float8E4M3FN if use_nvfp4 else cutlass.Float8E8M0FNU
             batch_size = 1
 
             if tactic is None or tactic == -1:
@@ -3527,12 +3527,8 @@ def _cute_dsl_gemm_fp4_runner(
                         assumed_align=16,
                     )
                 # SF tensors: pointers (complex 6D layout, not expressible as torch tensor)
-                a_sf_ptr = make_ptr(
-                    cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
-                )
-                b_sf_ptr = make_ptr(
-                    cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
-                )
+                a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+                b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
                 # Alpha: 1-dim tensor, torch tensor at runtime
                 alpha_fake = cute.runtime.make_fake_compact_tensor(
                     cutlass.Float32, (1,), assumed_align=4
@@ -3824,7 +3820,8 @@ def mm_fp4(
     -----
     When cudnn/cutlass backend is used, both a and b should quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False.
     When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False`.
-    When cute_dsl backend is used, both a and b should be quantized with nvfp4_quantize using the 128x4 scale factor layout and do_shuffle=False (same as cudnn/cutlass).
+    When cute_dsl backend is used, both a and b should be quantized with 128x4 scale factor layout:
+    nvfp4_quantize(..., do_shuffle=False) for NVFP4, or mxfp4_quantize(...) for MXFP4.
 
     Returns
     -------
@@ -3877,7 +3874,7 @@ def mm_fp4(
             major, minor
         ).cutlass_fp4_gemm_runner(),
         "cute-dsl": lambda: _cute_dsl_gemm_fp4_runner(
-            major, minor, enable_pdl, out_dtype
+            major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
     }
     runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
