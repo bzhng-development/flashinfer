@@ -804,7 +804,7 @@ template <bool AllReduceOut, bool ResidualOut, bool NormOut, bool QuantOut, type
 __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int access_id, int token_id,
                                          int access_id_in_token, AllReduceFusionParams<T>& params) {
   if constexpr (AllReduceOut) {
-    val.store(reinterpret_cast<T*>(params.moe_allreduce_out) + access_id * VEC_SIZE);
+    val.store_256b(reinterpret_cast<T*>(params.moe_allreduce_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> residual_val;
   residual_val.load_l2_256B(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
@@ -813,12 +813,12 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
   gamma_val.load_l2_256B(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
   residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
-    residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
+    residual_val.store_256b(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> norm_val;
   norm_val = rms_norm<T, VEC_SIZE>(residual_val, gamma_val, params.rms_eps, params.hidden_dim);
   if constexpr (NormOut) {
-    norm_val.store(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
+    norm_val.store_256b(reinterpret_cast<T*>(params.norm_out) + access_id * VEC_SIZE);
   }
 #if CUDA_VERSION >= 12080
   if constexpr (QuantOut) {

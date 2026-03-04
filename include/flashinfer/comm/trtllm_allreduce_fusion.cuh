@@ -961,18 +961,18 @@ class FusedOp {
   // template <typename T, uint32_t VEC_SIZE>
   __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id) {
     if constexpr (HasAllReduceOut<Pattern>) {
-      val.store(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
+      val.store_256b(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
     }
     if constexpr (HasResidual<Pattern>) {
       val = vec_add<T, VEC_SIZE>(val, m_residual_val);
       if constexpr (HasResidualOut<Pattern>) {
-        val.store(reinterpret_cast<T*>(m_params.residual_out) + m_access_id * VEC_SIZE);
+        val.store_256b(reinterpret_cast<T*>(m_params.residual_out) + m_access_id * VEC_SIZE);
       }
     }
     if constexpr (HasRMSNorm<Pattern>) {
       val = rms_norm(val, m_gamma_val);
       if constexpr (HasNormOut<Pattern>) {
-        val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
+        val.store_256b(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
       }
     }
 

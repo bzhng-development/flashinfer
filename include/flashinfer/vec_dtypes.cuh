@@ -48,13 +48,9 @@ __device__ __forceinline__ int4 ld_global_acquire(int4* addr) {
   return val;
 }
 
-// Load 16 bytes with L2 256-byte sector prefetch hint (sm_100+).
-// On sm_100+ (Blackwell), instructs L2 to fetch a full 256B sector, warming up
-// data for neighboring threads accessing sequential addresses.
-// Falls back to regular LDG.128 on older architectures.
 __device__ __forceinline__ int4 ld_global_l2_256B(const int4* addr) {
   int4 val;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
   asm volatile("ld.global.L2::256B.v4.s32 {%0,%1,%2,%3}, [%4];"
                : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
                : "l"(addr));
@@ -62,6 +58,47 @@ __device__ __forceinline__ int4 ld_global_l2_256B(const int4* addr) {
   val = *addr;
 #endif
   return val;
+}
+
+struct alignas(32) u32x8_t {
+  uint32_t u0, u1, u2, u3, u4, u5, u6, u7;
+};
+
+__device__ __forceinline__ u32x8_t ld_global_256b(const u32x8_t* addr) {
+  u32x8_t val;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
+  asm volatile("ld.global.nc.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+               : "=r"(val.u0), "=r"(val.u1), "=r"(val.u2), "=r"(val.u3), "=r"(val.u4), "=r"(val.u5),
+                 "=r"(val.u6), "=r"(val.u7)
+               : "l"(addr));
+#else
+  const uint4* p = reinterpret_cast<const uint4*>(addr);
+  uint4 lo = p[0];
+  uint4 hi = p[1];
+  val.u0 = lo.x;
+  val.u1 = lo.y;
+  val.u2 = lo.z;
+  val.u3 = lo.w;
+  val.u4 = hi.x;
+  val.u5 = hi.y;
+  val.u6 = hi.z;
+  val.u7 = hi.w;
+#endif
+  return val;
+}
+
+__device__ __forceinline__ void st_global_256b(u32x8_t* addr, const u32x8_t& val) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDACC_VER_MAJOR__ >= 13)
+  asm volatile("st.global.v8.u32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};"
+               :
+               : "l"(addr), "r"(val.u0), "r"(val.u1), "r"(val.u2), "r"(val.u3), "r"(val.u4),
+                 "r"(val.u5), "r"(val.u6), "r"(val.u7)
+               : "memory");
+#else
+  uint4* p = reinterpret_cast<uint4*>(addr);
+  p[0] = make_uint4(val.u0, val.u1, val.u2, val.u3);
+  p[1] = make_uint4(val.u4, val.u5, val.u6, val.u7);
+#endif
 }
 
 __device__ __forceinline__ void st_global_volatile(int4 const& val, int4* addr) {
@@ -1401,10 +1438,30 @@ struct vec_t<half, vec_size> {
       data[i] = ld_global_l2_256B((const int4*)ptr + i);
     }
   }
+  FLASHINFER_INLINE void load_256b(const half* ptr) {
+#pragma unroll
+    for (size_t i = 0; i + 1 < vec_size / 8; i += 2) {
+      *reinterpret_cast<u32x8_t*>(&data[i]) =
+          ld_global_256b(reinterpret_cast<const u32x8_t*>((const int4*)ptr + i));
+    }
+    if constexpr ((vec_size / 8) % 2 != 0) {
+      data[vec_size / 8 - 1] = ((const int4*)ptr)[vec_size / 8 - 1];
+    }
+  }
   FLASHINFER_INLINE void store(half* ptr) const {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((int4*)ptr)[i] = data[i];
+    }
+  }
+  FLASHINFER_INLINE void store_256b(half* ptr) const {
+#pragma unroll
+    for (size_t i = 0; i + 1 < vec_size / 8; i += 2) {
+      st_global_256b(reinterpret_cast<u32x8_t*>((int4*)ptr + i),
+                     *reinterpret_cast<const u32x8_t*>(&data[i]));
+    }
+    if constexpr ((vec_size / 8) % 2 != 0) {
+      ((int4*)ptr)[vec_size / 8 - 1] = data[vec_size / 8 - 1];
     }
   }
   FLASHINFER_INLINE void load_global_acquire(half* addr) {
@@ -1614,10 +1671,30 @@ struct vec_t<nv_bfloat16, vec_size> {
       data[i] = ld_global_l2_256B((const int4*)ptr + i);
     }
   }
+  FLASHINFER_INLINE void load_256b(const nv_bfloat16* ptr) {
+#pragma unroll
+    for (size_t i = 0; i + 1 < vec_size / 8; i += 2) {
+      *reinterpret_cast<u32x8_t*>(&data[i]) =
+          ld_global_256b(reinterpret_cast<const u32x8_t*>((const int4*)ptr + i));
+    }
+    if constexpr ((vec_size / 8) % 2 != 0) {
+      data[vec_size / 8 - 1] = ((const int4*)ptr)[vec_size / 8 - 1];
+    }
+  }
   FLASHINFER_INLINE void store(nv_bfloat16* ptr) const {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((int4*)ptr)[i] = data[i];
+    }
+  }
+  FLASHINFER_INLINE void store_256b(nv_bfloat16* ptr) const {
+#pragma unroll
+    for (size_t i = 0; i + 1 < vec_size / 8; i += 2) {
+      st_global_256b(reinterpret_cast<u32x8_t*>((int4*)ptr + i),
+                     *reinterpret_cast<const u32x8_t*>(&data[i]));
+    }
+    if constexpr ((vec_size / 8) % 2 != 0) {
+      ((int4*)ptr)[vec_size / 8 - 1] = data[vec_size / 8 - 1];
     }
   }
   FLASHINFER_INLINE void store_global_release(nv_bfloat16* addr) const {
