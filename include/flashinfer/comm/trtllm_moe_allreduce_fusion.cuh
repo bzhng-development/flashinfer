@@ -807,10 +807,10 @@ __device__ __forceinline__ void fused_op(vec_t<T, VEC_SIZE> const& val, int acce
     val.store(reinterpret_cast<T*>(params.moe_allreduce_out) + access_id * VEC_SIZE);
   }
   vec_t<T, VEC_SIZE> residual_val;
-  residual_val.load(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
+  residual_val.load_l2_256B(reinterpret_cast<T*>(params.residual_in) + access_id * VEC_SIZE);
 
   vec_t<T, VEC_SIZE> gamma_val;
-  gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
+  gamma_val.load_l2_256B(reinterpret_cast<T*>(params.rms_gamma) + access_id_in_token * VEC_SIZE);
   residual_val = vec_add<T, VEC_SIZE>(val, residual_val);
   if constexpr (ResidualOut) {
     residual_val.store(reinterpret_cast<T*>(params.residual_out) + access_id * VEC_SIZE);
@@ -999,8 +999,9 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
       int thread_offset_across_actexp_token =
           actexp_i * (params.hidden_dim * num_token) + thread_offset_across_token;
       vec_t<T, VEC_SIZE> actexp_i_data;
-      actexp_i_data.load(reinterpret_cast<T*>(params.moe_reduction_active_experts_token_input) +
-                         thread_offset_across_actexp_token);
+      actexp_i_data.load_l2_256B(
+          reinterpret_cast<T*>(params.moe_reduction_active_experts_token_input) +
+          thread_offset_across_actexp_token);
 
       // * Load active expert i's token j's scale
       int thread_offset_scale = actexp_i * num_token + token_id;
@@ -1017,8 +1018,8 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(
 
     // * FC2 + reduced(gGEMM2)
     vec_t<T, VEC_SIZE> fc2_data;
-    fc2_data.load(reinterpret_cast<T*>(params.moe_reduction_token_input) +
-                  thread_offset_across_token);
+    fc2_data.load_l2_256B(reinterpret_cast<T*>(params.moe_reduction_token_input) +
+                          thread_offset_across_token);
     accumulator = vec_add<T, VEC_SIZE>(accumulator, fc2_data);
 
     // * AR Store
@@ -1304,7 +1305,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       }
 
       vec_t<T, VEC_SIZE> permuted_data;
-      permuted_data.load(reinterpret_cast<T*>(params.allreduce_in) + thread_offset_across_token);
+      permuted_data.load_l2_256B(reinterpret_cast<T*>(params.allreduce_in) +
+                                 thread_offset_across_token);
 
       // * acc += scale(data)
 #pragma unroll
@@ -1319,8 +1321,8 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       // * Load shared expert output
       int thread_offset_across_token = token_id * params.hidden_dim + thread_offset_within_token;
       vec_t<T, VEC_SIZE> shared_expert_output;
-      shared_expert_output.load(reinterpret_cast<T*>(params.shared_expert_output) +
-                                thread_offset_across_token);
+      shared_expert_output.load_l2_256B(reinterpret_cast<T*>(params.shared_expert_output) +
+                                        thread_offset_across_token);
 #pragma unroll
       accumulator = vec_add<T, VEC_SIZE>(accumulator, shared_expert_output);
     }

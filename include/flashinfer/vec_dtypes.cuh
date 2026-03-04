@@ -48,6 +48,22 @@ __device__ __forceinline__ int4 ld_global_acquire(int4* addr) {
   return val;
 }
 
+// Load 16 bytes with L2 256-byte sector prefetch hint (sm_100+).
+// On sm_100+ (Blackwell), instructs L2 to fetch a full 256B sector, warming up
+// data for neighboring threads accessing sequential addresses.
+// Falls back to regular LDG.128 on older architectures.
+__device__ __forceinline__ int4 ld_global_l2_256B(const int4* addr) {
+  int4 val;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile("ld.global.L2::256B.v4.s32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+               : "l"(addr));
+#else
+  val = *addr;
+#endif
+  return val;
+}
+
 __device__ __forceinline__ void st_global_volatile(int4 const& val, int4* addr) {
   asm volatile("st.volatile.global.v4.b32 [%4], {%0, %1, %2, %3};" ::"r"(val.x), "r"(val.y),
                "r"(val.z), "r"(val.w), "l"(addr));
@@ -1379,6 +1395,12 @@ struct vec_t<half, vec_size> {
       data[i] = ((int4*)ptr)[i];
     }
   }
+  FLASHINFER_INLINE void load_l2_256B(const half* ptr) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      data[i] = ld_global_l2_256B((const int4*)ptr + i);
+    }
+  }
   FLASHINFER_INLINE void store(half* ptr) const {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
@@ -1584,6 +1606,12 @@ struct vec_t<nv_bfloat16, vec_size> {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       data[i] = ((int4*)ptr)[i];
+    }
+  }
+  FLASHINFER_INLINE void load_l2_256B(const nv_bfloat16* ptr) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 8; ++i) {
+      data[i] = ld_global_l2_256B((const int4*)ptr + i);
     }
   }
   FLASHINFER_INLINE void store(nv_bfloat16* ptr) const {
@@ -1972,6 +2000,12 @@ struct vec_t<float, vec_size> {
 #pragma unroll
     for (size_t i = 0; i < vec_size / 4; ++i) {
       data[i] = ((float4*)ptr)[i];
+    }
+  }
+  FLASHINFER_INLINE void load_l2_256B(const float* ptr) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      *reinterpret_cast<int4*>(data + i) = ld_global_l2_256B((const int4*)ptr + i);
     }
   }
   FLASHINFER_INLINE void store(float* ptr) const {
