@@ -330,7 +330,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
-        "12.0": [],
+        "12.0": ["cutlass"],
     },
     "group_gemm_fp8_nt_groupwise": {
         "7.5": [],
@@ -340,7 +340,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
-        "12.0": [],
+        "12.0": ["cutlass"],
     },
     "bmm_fp8": {
         "7.5": [],
