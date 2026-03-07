@@ -155,12 +155,12 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
   using ElementCompute = float;
 
   using CooperativeMmaTileShape_MNK = Shape<_128, _128, _128>;
-  // CUTLASS 87b uses this smaller tile for pingpong to reduce register pressure.
   using PingpongMmaTileShape_MNK = Shape<_64, _128, _128>;
   using ClusterShape_MNK = Shape<_1, _1, _1>;
-  constexpr int kSwapABThresholdM = 32;
 
-  // SM120's Sm120BlockwiseScaleConfig takes UMMA::Major parameters based on ScaleMajorK
+  // Pingpong tile M=64 requires ScaleGranularityM to divide 64.
+  constexpr bool kCanUsePingpong = (64 % ScaleGranularityM == 0);
+
   using ScaleConfig = std::conditional_t<
       ScaleMajorK,
       cutlass::detail::Sm120BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN,
@@ -169,7 +169,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
                                                  ScaleGranularityK, UMMA::Major::MN,
                                                  UMMA::Major::MN>>;
 
-  // Use decltype like SM100 does for consistency
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
@@ -179,16 +178,8 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
       ElementCompute, ElementC, LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
       cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-  using PingpongCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, PingpongMmaTileShape_MNK,
-      ClusterShape_MNK, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
-      ElementCompute, ElementC, LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
-
   using CooperativeStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
       sizeof(typename CooperativeCollectiveEpilogue::SharedStorage))>;
-  using PingpongStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-      sizeof(typename PingpongCollectiveEpilogue::SharedStorage))>;
 
   using CooperativeCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,
@@ -196,119 +187,46 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
       AlignmentB, ElementAccumulator, CooperativeMmaTileShape_MNK, ClusterShape_MNK,
       CooperativeStageCount, cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
 
-  using PingpongCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,
-      cute::tuple<LayoutA, LayoutSFA>, AlignmentA, ElementB, cute::tuple<LayoutB, LayoutSFB>,
-      AlignmentB, ElementAccumulator, PingpongMmaTileShape_MNK, ClusterShape_MNK,
-      PingpongStageCount,
-      cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120>::CollectiveOp;
-
   using CooperativeGemmKernel =
       cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CooperativeCollectiveMainloop,
                                            CooperativeCollectiveEpilogue, void>;
-  using PingpongGemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, PingpongCollectiveMainloop,
-                                           PingpongCollectiveEpilogue, void>;
 
   using CooperativeGemm = cutlass::gemm::device::GemmUniversalAdapter<CooperativeGemmKernel>;
-  using PingpongGemm = cutlass::gemm::device::GemmUniversalAdapter<PingpongGemmKernel>;
 
-  // SwapAB path for very small M.
-  // This is only enabled for 128x128x128 blockscale granularity, where both operands stay
-  // compatible with SM120's ScaleGranularityN == 128 requirement after swapping.
-  if constexpr (ScaleGranularityM == 128 && ScaleGranularityN == 128 && ScaleGranularityK == 128) {
-    if (m <= kSwapABThresholdM) {
-      using SwapLayoutA = LayoutB;
-      using SwapLayoutB = LayoutA;
-      using SwapLayoutC = cutlass::layout::ColumnMajor;
-      using SwapLayoutD = SwapLayoutC;
-      constexpr int SwapAlignmentA = AlignmentB;
-      constexpr int SwapAlignmentB = AlignmentA;
-      constexpr int SwapAlignmentC = AlignmentC;
-      constexpr int SwapAlignmentD = AlignmentD;
+  // Guard pingpong type instantiation behind if constexpr so the CUTLASS builder's
+  // static_assert (tile_M % ScaleGranularityM == 0) is never triggered for
+  // ScaleGranularityM=128 with tile_M=64.
+  if constexpr (kCanUsePingpong) {
+    using PingpongCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, PingpongMmaTileShape_MNK,
+        ClusterShape_MNK, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+        ElementCompute, ElementC, LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-      using SwapScaleConfig =
-          std::conditional_t<ScaleMajorK,
-                             cutlass::detail::Sm120BlockwiseScaleConfig<
-                                 ScaleGranularityN, ScaleGranularityM, ScaleGranularityK,
-                                 UMMA::Major::K, UMMA::Major::K>,
-                             cutlass::detail::Sm120BlockwiseScaleConfig<
-                                 ScaleGranularityN, ScaleGranularityM, ScaleGranularityK,
-                                 UMMA::Major::MN, UMMA::Major::MN>>;
+    using PingpongStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+        sizeof(typename PingpongCollectiveEpilogue::SharedStorage))>;
 
-      using SwapLayoutSFA = decltype(SwapScaleConfig::deduce_layoutSFA());
-      using SwapLayoutSFB = decltype(SwapScaleConfig::deduce_layoutSFB());
+    using PingpongCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,
+        cute::tuple<LayoutA, LayoutSFA>, AlignmentA, ElementB, cute::tuple<LayoutB, LayoutSFB>,
+        AlignmentB, ElementAccumulator, PingpongMmaTileShape_MNK, ClusterShape_MNK,
+        PingpongStageCount,
+        cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120>::CollectiveOp;
 
-      using SwapCooperativeCollectiveEpilogue =
-          typename cutlass::epilogue::collective::CollectiveBuilder<
-              cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, CooperativeMmaTileShape_MNK,
-              ClusterShape_MNK, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
-              ElementCompute, ElementC, SwapLayoutC, SwapAlignmentC, ElementD, SwapLayoutD,
-              SwapAlignmentD, cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+    using PingpongGemmKernel =
+        cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, PingpongCollectiveMainloop,
+                                             PingpongCollectiveEpilogue, void>;
 
-      using SwapPingpongCollectiveEpilogue =
-          typename cutlass::epilogue::collective::CollectiveBuilder<
-              cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, PingpongMmaTileShape_MNK,
-              ClusterShape_MNK, cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
-              ElementCompute, ElementC, SwapLayoutC, SwapAlignmentC, ElementD, SwapLayoutD,
-              SwapAlignmentD, cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+    using PingpongGemm = cutlass::gemm::device::GemmUniversalAdapter<PingpongGemmKernel>;
 
-      using SwapCooperativeStageCount =
-          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-              sizeof(typename SwapCooperativeCollectiveEpilogue::SharedStorage))>;
-      using SwapPingpongStageCount =
-          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-              sizeof(typename SwapPingpongCollectiveEpilogue::SharedStorage))>;
-
-      using SwapCooperativeCollectiveMainloop =
-          typename cutlass::gemm::collective::CollectiveBuilder<
-              cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,
-              cute::tuple<SwapLayoutA, SwapLayoutSFA>, SwapAlignmentA, ElementB,
-              cute::tuple<SwapLayoutB, SwapLayoutSFB>, SwapAlignmentB, ElementAccumulator,
-              CooperativeMmaTileShape_MNK, ClusterShape_MNK, SwapCooperativeStageCount,
-              cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
-
-      using SwapPingpongCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-          cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, ElementA,
-          cute::tuple<SwapLayoutA, SwapLayoutSFA>, SwapAlignmentA, ElementB,
-          cute::tuple<SwapLayoutB, SwapLayoutSFB>, SwapAlignmentB, ElementAccumulator,
-          PingpongMmaTileShape_MNK, ClusterShape_MNK, SwapPingpongStageCount,
-          cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120>::CollectiveOp;
-
-      using SwapCooperativeGemmKernel =
-          cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,
-                                               SwapCooperativeCollectiveMainloop,
-                                               SwapCooperativeCollectiveEpilogue, void>;
-      using SwapPingpongGemmKernel =
-          cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,
-                                               SwapPingpongCollectiveMainloop,
-                                               SwapPingpongCollectiveEpilogue, void>;
-
-      using SwapCooperativeGemm =
-          cutlass::gemm::device::GemmUniversalAdapter<SwapCooperativeGemmKernel>;
-      using SwapPingpongGemm = cutlass::gemm::device::GemmUniversalAdapter<SwapPingpongGemmKernel>;
-
-      auto swap_status =
-          TrySm120PingpongThenCooperative<SwapPingpongGemm, SwapCooperativeGemm, SwapScaleConfig>(
-              float_buffer, float_buffer_size_in_bytes,
-              /*A_ptr=*/B_ptr,
-              /*B_ptr=*/A_ptr,
-              /*SFA_ptr=*/SFB_ptr,
-              /*SFB_ptr=*/SFA_ptr, D_ptr,
-              /*m=*/n,
-              /*n=*/m, k, l, stream);
-      if (swap_status == cudaSuccess) {
-        return swap_status;
-      }
-      if (swap_status != cudaErrorNotSupported && swap_status != cudaErrorInsufficientDriver) {
-        return swap_status;
-      }
-    }
+    return TrySm120PingpongThenCooperative<PingpongGemm, CooperativeGemm, ScaleConfig>(
+        float_buffer, float_buffer_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, D_ptr, m, n, k, l,
+        stream);
+  } else {
+    return RunSm120GroupwiseGemm<CooperativeGemm, ScaleConfig>(
+        float_buffer, float_buffer_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, D_ptr, m, n, k, l,
+        stream);
   }
-
-  return TrySm120PingpongThenCooperative<PingpongGemm, CooperativeGemm, ScaleConfig>(
-      float_buffer, float_buffer_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, D_ptr, m, n, k, l,
-      stream);
 #else
   return cudaErrorNotSupported;
 #endif
