@@ -91,16 +91,6 @@ def parse_gemm_args(line, parser):
         help="Tile size for the gemm operation.",
     )
     parser.add_argument(
-        "--scale_granularity_mnk",
-        type=str,
-        required=False,
-        default=None,
-        help=(
-            "Optional explicit FP8 scale granularity as m,n,k (e.g. 1,128,128 or 128,128,128). "
-            "If not set, gemm_fp8_nt_groupwise uses (1,tile_size,tile_size)."
-        ),
-    )
-    parser.add_argument(
         "--group_size",
         type=int,
         required=False,
@@ -199,59 +189,6 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
     return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
-def _parse_scale_granularity_mnk(v):
-    if v is None:
-        return None
-    vals = [int(x.strip()) for x in v.split(",") if x.strip()]
-    if len(vals) != 3:
-        raise ValueError(
-            f"scale_granularity_mnk must be 3 comma-separated integers, got: {v}"
-        )
-    if any(x <= 0 for x in vals):
-        raise ValueError(
-            f"scale_granularity_mnk entries must be positive, got: {tuple(vals)}"
-        )
-    return tuple(vals)
-
-
-def _round_up(x, y):
-    return ((x + y - 1) // y) * y
-
-
-def _quantize_fp8_with_padding(x, gran_m, gran_k, scale_major_mode):
-    m, k = x.shape
-    m_pad = _round_up(m, gran_m)
-    k_pad = _round_up(k, gran_k)
-
-    x_pad = torch.zeros((m_pad, k_pad), dtype=x.dtype, device=x.device)
-    x_pad[:m, :k] = x
-
-    if scale_major_mode == "K":
-        scale_shape = (m_pad // gran_m, k_pad // gran_k)
-    else:
-        scale_shape = (k_pad // gran_k, m_pad // gran_m)
-
-    x_fp8_pad, x_scale = quantize_fp8(
-        x_pad, scale_shape, (gran_m, gran_k), scale_major_mode
-    )
-    return x_fp8_pad[:m, :k].contiguous(), x_scale
-
-
-def _dequantize_fp8_with_padding(x_fp8, x_scale, gran_m, gran_k, scale_major_mode):
-    m, k = x_fp8.shape
-    if scale_major_mode == "K":
-        m_pad = x_scale.shape[0] * gran_m
-        k_pad = x_scale.shape[1] * gran_k
-    else:
-        m_pad = x_scale.shape[1] * gran_m
-        k_pad = x_scale.shape[0] * gran_k
-
-    x_fp8_pad = torch.zeros((m_pad, k_pad), dtype=x_fp8.dtype, device=x_fp8.device)
-    x_fp8_pad[:m, :k] = x_fp8
-    x_deq_pad = dequantize_fp8(x_fp8_pad, x_scale, scale_major_mode)
-    return x_deq_pad[:m, :k]
-
-
 def testGemmFp8NtGroupwise(args):
     """
     Test gemm_fp8_nt_groupwise API.
@@ -286,10 +223,6 @@ def testGemmFp8NtGroupwise(args):
     k = args.k
     tile_size = args.tile_size
     scale_major_mode = args.scale_major_mode
-    scale_granularity_mnk = _parse_scale_granularity_mnk(args.scale_granularity_mnk)
-    if scale_granularity_mnk is None:
-        scale_granularity_mnk = (1, tile_size, tile_size)
-    gran_m, gran_n, gran_k = scale_granularity_mnk
     mma_sm = args.mma_sm
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
@@ -312,11 +245,6 @@ def testGemmFp8NtGroupwise(args):
                 "[INFO] trtllm only supports MN scale_major_mode, removing trtllm from backends"
             )
             remove_trtllm = True
-        if scale_granularity_mnk != (1, 128, 128):
-            print(
-                "[INFO] trtllm only supports scale_granularity_mnk=(1,128,128), removing trtllm from backends"
-            )
-            remove_trtllm = True
         if k < 256:
             print("[INFO] trtllm only supports k >= 256, removing trtllm from backends")
             remove_trtllm = True
@@ -335,8 +263,18 @@ def testGemmFp8NtGroupwise(args):
         print(f"[VVERBOSE] {a_val.shape = }")
         print(f"[VVERBOSE] {b_val.shape = }")
 
-    a_fp8, a_scale = _quantize_fp8_with_padding(a_val, gran_m, gran_k, scale_major_mode)
-    b_fp8, b_scale = _quantize_fp8_with_padding(b_val, gran_n, gran_k, scale_major_mode)
+    if scale_major_mode == "K":
+        a_scale_shape = (m, k // tile_size)
+        b_scale_shape = (n // tile_size, k // tile_size)
+    else:
+        a_scale_shape = (k // tile_size, m)
+        b_scale_shape = (k // tile_size, n // tile_size)
+
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (tile_size, tile_size)
+
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {a_fp8.shape = }")
@@ -344,12 +282,8 @@ def testGemmFp8NtGroupwise(args):
         print(f"[VVERBOSE] {a_scale.shape = }")
         print(f"[VVERBOSE] {b_scale.shape = }")
 
-    a_dequant = _dequantize_fp8_with_padding(
-        a_fp8, a_scale, gran_m, gran_k, scale_major_mode
-    )
-    b_dequant = _dequantize_fp8_with_padding(
-        b_fp8, b_scale, gran_n, gran_k, scale_major_mode
-    )
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
     def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
         if backend in ["cutlass", "trtllm"]:
@@ -359,7 +293,6 @@ def testGemmFp8NtGroupwise(args):
                 a_scale=a_scale,
                 b_scale=b_scale,
                 scale_major_mode=scale_major_mode,
-                scale_granularity_mnk=scale_granularity_mnk,
                 out_dtype=out_dtype,
                 mma_sm=mma_sm,
                 backend=backend,
@@ -436,9 +369,6 @@ def testGemmFp8NtGroupwise(args):
             cur_res["n"] = n
             cur_res["k"] = k
             cur_res["tile_size"] = tile_size
-            cur_res["scale_granularity_m"] = gran_m
-            cur_res["scale_granularity_n"] = gran_n
-            cur_res["scale_granularity_k"] = gran_k
             cur_res["scale_major_mode"] = scale_major_mode
             cur_res["out_dtype"] = out_dtype
             cur_res["mma_sm"] = mma_sm
@@ -1141,6 +1071,13 @@ def testMmFp4(args):
         print(f"[VVERBOSE] {mat2_fp4.dtype = }")
 
     alpha = 1.0 / (global_sf_input * global_sf_mat2) if use_nvfp4 else None
+    # TODO: for MXFP4, we don't need a global scale, we should change the compile interface to make
+    # alpha optional.
+    alpha_for_cute_dsl_mxfp4 = (
+        torch.tensor([1.0], dtype=torch.float32, device=device)
+        if not use_nvfp4
+        else None
+    )
     # Completed preparing inputs. Now programmatically filter backends
     block_size = 16 if use_nvfp4 else 32
     backends_to_remove = []
@@ -1161,7 +1098,7 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=alpha,
+                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
                 out_dtype=res_dtype,
                 block_size=16
                 if use_nvfp4
@@ -1199,7 +1136,7 @@ def testMmFp4(args):
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
                 a_descale=input_inv_s,
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
-                alpha=alpha,
+                alpha=(alpha_for_cute_dsl_mxfp4 if (backend == "cute-dsl") else alpha),
                 out_dtype=res_dtype,
                 block_size=block_size,
                 use_8x4_sf_layout=not use_128x4_sf_layout,
@@ -1359,9 +1296,7 @@ def testMmMxfp8(args):
     res_dtype = args.out_dtype
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
-    autotune_supported_backends = [
-        "cutlass",
-    ]
+    autotune_supported_backends = ["cutlass", "cute-dsl", "auto"]
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1414,7 +1349,7 @@ def testMmMxfp8(args):
         print(f"[VVERBOSE] {mat2_scale.dtype = }")
 
     def run_backend(backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale):
-        if backend == "cutlass":
+        if backend in ["cutlass", "cute-dsl", "auto"]:
             return flashinfer.gemm.mm_mxfp8(
                 a=input_mxfp8,
                 b=mat2_mxfp8.t(),  # mm_mxfp8 expects b.t()
