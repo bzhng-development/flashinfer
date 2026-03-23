@@ -933,10 +933,12 @@ class FusedOp {
                                      int access_id_in_token)
       : m_params(params), m_access_id(access_id), m_access_id_in_token(access_id_in_token) {
     if constexpr (HasRMSNorm<Pattern>) {
-      m_gamma_val.load(reinterpret_cast<T*>(params.rms_gamma) + m_access_id_in_token * VEC_SIZE);
+      m_gamma_val.load_l2_256B(reinterpret_cast<T*>(params.rms_gamma) +
+                               m_access_id_in_token * VEC_SIZE);
     }
     if constexpr (HasResidual<Pattern>) {
-      m_residual_val.load(reinterpret_cast<T*>(params.residual_in) + m_access_id * VEC_SIZE);
+      m_residual_val.load_l2_256B(reinterpret_cast<T*>(params.residual_in) +
+                                  m_access_id * VEC_SIZE);
     }
     if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
       m_scale_factor = 1.f / *(params.scale_factor);
@@ -950,7 +952,8 @@ class FusedOp {
     if (m_access_id != access_id) {
       m_access_id = access_id;
       if constexpr (HasResidual<Pattern>) {
-        m_residual_val.load(reinterpret_cast<T*>(m_params.residual_in) + m_access_id * VEC_SIZE);
+        m_residual_val.load_l2_256B(reinterpret_cast<T*>(m_params.residual_in) +
+                                    m_access_id * VEC_SIZE);
       }
     }
   }
@@ -958,18 +961,18 @@ class FusedOp {
   // template <typename T, uint32_t VEC_SIZE>
   __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id) {
     if constexpr (HasAllReduceOut<Pattern>) {
-      val.store(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
+      val.store_256b(reinterpret_cast<T*>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
     }
     if constexpr (HasResidual<Pattern>) {
       val = vec_add<T, VEC_SIZE>(val, m_residual_val);
       if constexpr (HasResidualOut<Pattern>) {
-        val.store(reinterpret_cast<T*>(m_params.residual_out) + m_access_id * VEC_SIZE);
+        val.store_256b(reinterpret_cast<T*>(m_params.residual_out) + m_access_id * VEC_SIZE);
       }
     }
     if constexpr (HasRMSNorm<Pattern>) {
       val = rms_norm(val, m_gamma_val);
       if constexpr (HasNormOut<Pattern>) {
-        val.store(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
+        val.store_256b(reinterpret_cast<T*>(m_params.norm_out) + m_access_id * VEC_SIZE);
       }
     }
 
@@ -1212,7 +1215,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
     vec_t<T, VEC_SIZE> val;
-    val.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
+    val.load_l2_256B(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
     remove_neg_zero<T, VEC_SIZE>(val);
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
@@ -1277,8 +1280,8 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
     int comm_access_id = access_id + begin_tokens[r] * params.hidden_dim / VEC_SIZE;
     int comm_tot_access = (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim / VEC_SIZE;
     for (int idx = comm_access_id; idx < comm_tot_access; idx += access_stride) {
-      reinterpret_cast<float4*>(comm.comm_bufs[params.rank])[idx] =
-          reinterpret_cast<float4*>(params.allreduce_in)[idx];
+      reinterpret_cast<int4*>(comm.comm_bufs[params.rank])[idx] =
+          ld_global_l2_256B(reinterpret_cast<const int4*>(params.allreduce_in) + idx);
     }
   }
   Barrier<NRanks> barrier(params.rank, comm);
