@@ -19,9 +19,20 @@
 
 namespace flashinfer {
 namespace gemm {
-// SM120/121 only supports 1x1x1 cluster shape
-INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, true)
-INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, false)
+// SM120/121 only supports 1x1x1 cluster shape.
+// Cooperative mainloop is emitted for every tile shape; both the DP and StreamK
+// scheduler launchers are emitted alongside (StreamK is cooperative-only).
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, true,  false)
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, false, false)
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_STREAMK({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, true)
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_STREAMK({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, false)
+{% if cta_m == 128 and cta_n <= 128 %}
+// Pingpong mainloop only for tile_m=128 and tile_n<=128 tiles; CUTLASS Table 17 / Sm90
+// pingpong infrastructure assumes one warpgroup so the wide-M and wide-N variants are
+// cooperative-only.  Pingpong has no StreamK companion (incompatible).
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, true,  true)
+INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM, false, true)
+{% endif %}
 
 }  // namespace gemm
 }  // namespace flashinfer

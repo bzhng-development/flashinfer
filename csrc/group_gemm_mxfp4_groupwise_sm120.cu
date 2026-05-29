@@ -40,6 +40,9 @@ using namespace flashinfer;
     } else if (tile_n == 32) {                     \
       constexpr int TILE_N = 32;                   \
       return __VA_ARGS__();                        \
+    } else if (tile_n == 16) {                     \
+      constexpr int TILE_N = 16;                   \
+      return __VA_ARGS__();                        \
     }                                              \
     TVM_FFI_ICHECK(false) << "Unsupported TILE N"; \
     return false;                                  \

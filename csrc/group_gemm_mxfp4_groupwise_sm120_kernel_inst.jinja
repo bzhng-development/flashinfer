@@ -22,7 +22,7 @@ namespace flashinfer {
 namespace group_gemm {
 
 {% for tile_m in [128] %}
-{% for tile_n in [32, 64, 128] %}
+{% for tile_n in [16, 32, 64, 128] %}
 {% for tile_k in [128] %}
 {% for swap_ab in ["true", "false"] %}
 {% for dtype_sfa in ["cutlass::float_ue8m0_t"] %}

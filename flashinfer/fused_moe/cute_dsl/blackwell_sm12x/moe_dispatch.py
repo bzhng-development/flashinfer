@@ -2371,6 +2371,7 @@ def launch_sm120_moe(
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
     w1_alpha: torch.Tensor,
+    fc1_input_scale: Optional[torch.Tensor] = None,
     fc2_input_scale: Optional[torch.Tensor] = None,
     w2_weight: torch.Tensor,
     w2_weight_sf: torch.Tensor,
@@ -2433,6 +2434,12 @@ def launch_sm120_moe(
     if fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
     down_input_scale = fc2_input_scale
+    # FC1 input quant scale is a distinct per-expert scale from w1_alpha
+    # (which is the FC1 output dequant scale). When the caller does not
+    # supply fc1_input_scale, fall back to w1_alpha; this is only correct
+    # when input scale == output dequant scale (e.g., all-ones synthetic
+    # tests). Real ModelOpt NVFP4 checkpoints must pass fc1_input_scale.
+    fc1_input_gs = fc1_input_scale if fc1_input_scale is not None else w1_alpha
 
     weights = (
         _weight_views
@@ -2507,7 +2514,7 @@ def launch_sm120_moe(
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            input_gs=w1_alpha,
+            input_gs=fc1_input_gs,
             down_input_scale=down_input_scale,
             scatter_output=scatter_output,
             num_experts=num_experts,
@@ -2527,7 +2534,7 @@ def launch_sm120_moe(
             a=a,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
-            input_gs=w1_alpha,
+            input_gs=fc1_input_gs,
             down_input_scale=down_input_scale,
             scatter_output=scatter_output,
             num_experts=num_experts,
