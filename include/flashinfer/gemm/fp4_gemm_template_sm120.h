@@ -214,9 +214,9 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
 #else
 
 #define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_,                              \
-                                             XSM_, SWAP_AB_, USE_PINGPONG_)                                                  \
+                                             XSM_, SWAP_AB_)                                                                 \
   struct                                                                                                                     \
-      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_##USE_PINGPONG_ { \
+      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_ {         \
     using OutElementType = typename flashinfer::cutlass_dtype<T>::type;                                                      \
     using CTAShape = cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                                   \
     using Arch = cutlass::arch::Sm120; /* Use Sm120 for SM121 hardware */                                                    \
@@ -251,18 +251,14 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
         ElementC, LayoutC, AlignmentC, OutElementType, LayoutC, AlignmentC,                                                  \
         cutlass::epilogue::TmaWarpSpecialized, FusionOperation>::CollectiveOp;                                               \
                                                                                                                              \
-    /* SM120/SM121 BlockScaled - Use nv_float4_t without tuples like example 79 */                                           \
-    /* Dynamic stage carveout adapts pipeline depth to available smem after epilogue */                                      \
-    /* Mainloop schedule: Pingpong wins on skinny tiles, Cooperative on big tiles */                                         \
-    using MainloopScheduleTag =                                                                                              \
-        std::conditional_t<USE_PINGPONG_, cutlass::gemm::KernelTmaWarpSpecializedPingpong,                                   \
-                           cutlass::gemm::KernelTmaWarpSpecializedCooperative>;                                              \
+    /* SM120/SM121 BlockScaled - Use nv_float4_t without tuples like example 79.                                            \
+       Cooperative mainloop. */                                                                                              \
     using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<                                        \
         Arch, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,                                   \
         ElementAccumulator, ThreadBlockShape, ClusterShape,                                                                  \
         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(                                                  \
             sizeof(typename CollectiveEpilogue::SharedStorage))>,                                                            \
-        MainloopScheduleTag>::CollectiveOp;                                                                                  \
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;                                                   \
                                                                                                                      \
     /* Two scheduler options for different workloads */                                                              \
     /* See: https://github.com/NVIDIA/cutlass/blob/main/examples/79_blackwell_geforce_gemm */                        \
@@ -273,33 +269,31 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
         cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,                    \
                                              CollectiveEpilogue, TileSchedulerTag>;                                  \
                                                                                                                      \
-    /* Option 2: StreamK scheduler - better load balancing for small M/N, large K.                                  \
-       StreamK is incompatible with Pingpong; the helper templates below avoid forming                                \
-       GemmUniversal<Pingpong, StreamKScheduler> when USE_PINGPONG_=true. */                                          \
-    using GemmKernelStreamK = typename detail_fp4_sm120::StreamKKernelPicker<                                        \
-        USE_PINGPONG_, cute::Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>::type;                \
+    /* Option 2: StreamK scheduler - better load balancing for small M/N, large K. */                                \
+    using GemmKernelStreamK =                                                                                        \
+        cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>, CollectiveMainloop,                    \
+                                             CollectiveEpilogue, cutlass::gemm::StreamKScheduler>;                   \
                                                                                                                      \
     using GemmDefault = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelDefault>;                     \
-    using GemmStreamK = typename detail_fp4_sm120::GemmAdapterPicker<GemmKernelStreamK>::type;                        \
+    using GemmStreamK = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernelStreamK>;                     \
     using Gemm = GemmDefault; /* Default alias for compatibility */                                                  \
   };                                                                                                                 \
                                                                                                                      \
   /* DP-scheduler type alias.  The _StreamK alias is defined inside                                                          \
-     INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_STREAMK and only for the cooperative                                               \
-     mainloop, since StreamK is incompatible with Pingpong. */                                                               \
-  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##USE_PINGPONG_ =                                              \
-      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_##USE_PINGPONG_:: \
+     INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_STREAMK. */                                                                        \
+  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_ =                                                            \
+      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_::        \
           GemmDefault;                                                                                                       \
                                                                                                                              \
   /* DP scheduler launcher - uses common helper functions */                                                                 \
   template <>                                                                                                                \
   size_t genericFp4GemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>,                            \
                                       cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>,                               \
-                                      XSM_, SWAP_AB_, USE_PINGPONG_>(                                                        \
+                                      XSM_, SWAP_AB_>(                                                                       \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                                    \
       float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,                            \
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                                   \
-    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##USE_PINGPONG_;                           \
+    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_;                                         \
     if constexpr (SWAP_AB_) {                                                                                                \
       return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                               \
                                              batch_count, workspace, workspaceBytes, stream, "");                            \
@@ -309,23 +303,22 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
     }                                                                                                                        \
   }
 
-// StreamK scheduler launcher - separate macro since StreamK is incompatible with the
-// Pingpong mainloop schedule.  Only call this for USE_PINGPONG_=false instantiations.
-// MUST be invoked after INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(..., SWAP_AB_, false), which
-// defines the DeviceGemmFp4GemmSm120_..._false struct that this macro takes ::GemmStreamK from.
+// StreamK scheduler launcher - separate macro.  MUST be invoked after
+// INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(..., SWAP_AB_), which defines the
+// DeviceGemmFp4GemmSm120_... struct that this macro takes ::GemmStreamK from.
 #define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER_STREAMK(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_,                               \
                                                     CGA_K_, XSM_, SWAP_AB_)                                                   \
-  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##false##_StreamK =                                             \
-      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_##false:: \
+  using Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK =                                                    \
+      DeviceGemmFp4GemmSm120_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_##SWAP_AB_::         \
           GemmStreamK;                                                                                                        \
   template <>                                                                                                                 \
   size_t genericFp4GemmKernelLauncherStreamK<                                                                                 \
       T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>, cute::Int<CGA_M_>,                                          \
-      cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_, SWAP_AB_, /*UsePingpong=*/false>(                                           \
+      cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_, SWAP_AB_>(                                                                  \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                                     \
       float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,                             \
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                                    \
-    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##false##_StreamK;                          \
+    using Fp4GemmOperator = Fp4Gemm_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##SWAP_AB_##_StreamK;                                 \
     if constexpr (SWAP_AB_) {                                                                                                 \
       return runFp4GemmImpl<Fp4GemmOperator>(D, B, A, weight_sf, input_sf, global_sf, n, m, k,                                \
                                              batch_count, workspace, workspaceBytes, stream,                                  \

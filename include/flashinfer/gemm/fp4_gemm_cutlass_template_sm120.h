@@ -44,10 +44,10 @@ namespace flashinfer {
 namespace gemm {
 using namespace cute;
 
-// UseStreamK: false = DP scheduler (default), true = StreamK scheduler
-// UsePingpong: false = Cooperative mainloop, true = Pingpong mainloop
+// UseStreamK: false = DP scheduler (default), true = StreamK scheduler.
+// SM120 NVFP4 uses the Cooperative mainloop.
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool SwapAB,
-          bool UseStreamK = false, bool UsePingpong = false>
+          bool UseStreamK = false>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
                                                 float const* global_sf, int m, int n, int k,
@@ -57,18 +57,13 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
   // For SM120/SM121, only support 1x1x1 cluster shape
   // Always use 1x1x1 cluster shape regardless of gemmConfig.cluster_shape
   if constexpr (UseStreamK) {
-    // StreamK is incompatible with the Pingpong mainloop, so the StreamK launcher is only
-    // ever defined for the cooperative (UsePingpong=false) schedule.  Pin pingpong=false here
-    // so we never reference an undefined StreamK<..., pingpong=true> specialization, even if a
-    // (streamk + pingpong) gemmConfig reaches this dispatcher.
     return genericFp4GemmKernelLauncherStreamK<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
-                                               cute::Int<1>, cute::Int<1>, _1SM, SwapAB,
-                                               /*UsePingpong=*/false>(
+                                               cute::Int<1>, cute::Int<1>, _1SM, SwapAB>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
         workspaceBytes, stream, occupancy);
   } else {
     return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>,
-                                        cute::Int<1>, _1SM, SwapAB, UsePingpong>(
+                                        cute::Int<1>, _1SM, SwapAB>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
         workspaceBytes, stream, occupancy);
   }
@@ -93,30 +88,28 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
  * \param occupancy Optional pointer to store kernel occupancy
  * \return Size of workspace required in bytes
  */
-// Helper macro to dispatch tile config with full scheduler / swap_ab / mainloop selection.
-#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, SWAP_AB, USE_STREAMK, USE_PINGPONG)                \
-  return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<CTA_M>, cute::Int<CTA_N>,            \
-                                                  cute::Int<CTA_K>, SWAP_AB, USE_STREAMK,           \
-                                                  USE_PINGPONG>(                                    \
-      D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,         \
+// Helper macro to dispatch tile config with scheduler / swap_ab selection.
+#define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, SWAP_AB, USE_STREAMK)                     \
+  return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<CTA_M>, cute::Int<CTA_N>,    \
+                                                  cute::Int<CTA_K>, SWAP_AB, USE_STREAMK>(  \
+      D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, \
       workspaceBytes, stream, occupancy)
 
-// Dispatch with {StreamK, DP} x {swap_ab} scheduler selection.  The Pingpong mainloop is not
-// emitted for SM120 NVFP4 (it was removed: negligible/negative value vs Cooperative in
-// benchmarks), so every tile uses the Cooperative mainloop (USE_PINGPONG=false).
-#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)                   \
-  if (gemmConfig.use_stream_k) {                                       \
-    if (gemmConfig.swap_ab) {                                          \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true, false);    \
-    } else {                                                           \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, true, false);   \
-    }                                                                  \
-  } else {                                                             \
-    if (gemmConfig.swap_ab) {                                          \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, false, false);   \
-    } else {                                                           \
-      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false, false);  \
-    }                                                                  \
+// Dispatch with {StreamK, DP} x {swap_ab} scheduler selection.  SM120 NVFP4 uses the
+// Cooperative mainloop.
+#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)           \
+  if (gemmConfig.use_stream_k) {                               \
+    if (gemmConfig.swap_ab) {                                  \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true);   \
+    } else {                                                   \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, true);  \
+    }                                                          \
+  } else {                                                     \
+    if (gemmConfig.swap_ab) {                                  \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, false);  \
+    } else {                                                   \
+      DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false); \
+    }                                                          \
   }
 
 template <typename T>
@@ -213,8 +206,6 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   ClusterShape clusterShape = ClusterShape::ClusterShape_1x1x1;
 
   // Generate configs for {DP, StreamK} x {swap_ab}, all on the Cooperative mainloop.
-  // The Pingpong mainloop was removed for SM120 NVFP4 (negligible/negative value vs Cooperative
-  // in benchmarks, and it inflated the autotuner search space + mis-selection risk).
   for (auto const& tile_config : tilesSm120) {
     // DP scheduler (use_stream_k = false)
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
