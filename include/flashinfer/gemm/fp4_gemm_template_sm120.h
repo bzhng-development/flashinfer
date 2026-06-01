@@ -75,33 +75,8 @@ struct SMTypeAdapter<_2SM> {
 template <typename>
 constexpr auto always_false = false;
 
-namespace detail_fp4_sm120 {
-// Helper that resolves to GemmUniversal<...StreamKScheduler> only when UsePingpong=false.
-// For UsePingpong=true the type is `void`, which avoids ever forming the invalid
-// GemmUniversal<Pingpong, StreamKScheduler> template-id (the Sm90 Pingpong specialization
-// asserts/breaks when paired with StreamK).
-template <bool UsePingpong, typename ProblemShape, typename ML, typename EL>
-struct StreamKKernelPicker {
-  using type = cutlass::gemm::kernel::GemmUniversal<ProblemShape, ML, EL,
-                                                    cutlass::gemm::StreamKScheduler>;
-};
-template <typename ProblemShape, typename ML, typename EL>
-struct StreamKKernelPicker<true, ProblemShape, ML, EL> {
-  using type = void;
-};
-
-template <typename Kernel>
-struct GemmAdapterPicker {
-  using type = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
-};
-template <>
-struct GemmAdapterPicker<void> {
-  using type = void;
-};
-}  // namespace detail_fp4_sm120
-
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
-          typename CGA_N_, typename CGA_K_, typename XSM_, bool SwapAB, bool UsePingpong = false>
+          typename CGA_N_, typename CGA_K_, typename XSM_, bool SwapAB>
 size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
                                     void const* weight_sf, float const* global_sf, int m, int n,
                                     int k, int batch_count, CutlassGemmConfig gemmConfig,
@@ -109,7 +84,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                                     cudaStream_t stream, int* occupancy);
 
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
-          typename CGA_N_, typename CGA_K_, typename XSM_, bool SwapAB, bool UsePingpong = false>
+          typename CGA_N_, typename CGA_K_, typename XSM_, bool SwapAB>
 size_t genericFp4GemmKernelLauncherStreamK(void* D, void const* A, void const* B,
                                            void const* input_sf, void const* weight_sf,
                                            float const* global_sf, int m, int n, int k,
@@ -223,11 +198,11 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
 #ifdef PLACEHOLDER_KERNELS
 
 #define INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_,   \
-                                             XSM_, SWAP_AB_, USE_PINGPONG_)                       \
+                                             XSM_, SWAP_AB_)                                      \
   template <>                                                                                     \
   size_t genericFp4GemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>, \
                                       cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>,    \
-                                      XSM_, SWAP_AB_, USE_PINGPONG_>(                             \
+                                      XSM_, SWAP_AB_>(                                            \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,         \
       float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig, \
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {        \

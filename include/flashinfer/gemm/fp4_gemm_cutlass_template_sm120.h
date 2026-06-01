@@ -101,9 +101,10 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
       D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,         \
       workspaceBytes, stream, occupancy)
 
-// Cooperative-only dispatch (tiles where Pingpong is not emitted / not valid, e.g. 256-M or
-// 128-256 tiles per CUTLASS Table 17).
-#define DISPATCH_WITH_SCHEDULER_COOP_ONLY(CTA_M, CTA_N, CTA_K)         \
+// Dispatch with {StreamK, DP} x {swap_ab} scheduler selection.  The Pingpong mainloop is not
+// emitted for SM120 NVFP4 (it was removed: negligible/negative value vs Cooperative in
+// benchmarks), so every tile uses the Cooperative mainloop (USE_PINGPONG=false).
+#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)                   \
   if (gemmConfig.use_stream_k) {                                       \
     if (gemmConfig.swap_ab) {                                          \
       DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true, false);    \
@@ -116,40 +117,6 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
     } else {                                                           \
       DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false, false);  \
     }                                                                  \
-  }
-
-// Full dispatch including Pingpong vs Cooperative mainloop selection.  Tile shapes that the
-// jinja emits with BOTH mainloop variants reach this macro; the cooperative-only tiles
-// (256x128, 128x256) route through DISPATCH_WITH_SCHEDULER_COOP_ONLY instead.
-#define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)                     \
-  if (gemmConfig.mainloop_schedule == MainloopScheduleType::PINGPONG) {  \
-    if (gemmConfig.use_stream_k) {                                       \
-      if (gemmConfig.swap_ab) {                                          \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true, true);     \
-      } else {                                                           \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, true, true);    \
-      }                                                                  \
-    } else {                                                             \
-      if (gemmConfig.swap_ab) {                                          \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, false, true);    \
-      } else {                                                           \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false, true);   \
-      }                                                                  \
-    }                                                                    \
-  } else {                                                               \
-    if (gemmConfig.use_stream_k) {                                       \
-      if (gemmConfig.swap_ab) {                                          \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, true, false);    \
-      } else {                                                           \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, true, false);   \
-      }                                                                  \
-    } else {                                                             \
-      if (gemmConfig.swap_ab) {                                          \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, true, false, false);   \
-      } else {                                                           \
-        DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, false, false, false);  \
-      }                                                                  \
-    }                                                                    \
   }
 
 template <typename T>
@@ -178,9 +145,9 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B,
     case CutlassTileConfigSM120::CtaShape128x128x128B:
       DISPATCH_WITH_SCHEDULER(128, 128, 256);
     case CutlassTileConfigSM120::CtaShape256x128x64B:
-      DISPATCH_WITH_SCHEDULER_COOP_ONLY(256, 128, 128);
+      DISPATCH_WITH_SCHEDULER(256, 128, 128);
     case CutlassTileConfigSM120::CtaShape128x256x64B:
-      DISPATCH_WITH_SCHEDULER_COOP_ONLY(128, 256, 128);
+      DISPATCH_WITH_SCHEDULER(128, 256, 128);
     case CutlassTileConfigSM120::Undefined:
       throw std::runtime_error("[Error][FP4][dispatch_gemm_cta_shape] Gemm config undefined.");
     case CutlassTileConfigSM120::ChooseWithHeuristic:
@@ -193,7 +160,6 @@ size_t dispatchNVFP4xNVFP4GemmCTAShapeSm120(T* D, void const* A, void const* B,
 }
 
 #undef DISPATCH_WITH_SCHEDULER
-#undef DISPATCH_WITH_SCHEDULER_COOP_ONLY
 #undef DISPATCH_TILE_CONFIG
 
 template <typename T, FP4GemmType fp4GemmType>
@@ -246,52 +212,24 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   // SM120/SM121 only supports 1x1x1 cluster shape
   ClusterShape clusterShape = ClusterShape::ClusterShape_1x1x1;
 
-  // Tiles where both Cooperative and Pingpong mainloop schedules are emitted by the jinja.
-  // 256-M and 128-256 tiles are cooperative-only (per CUTLASS Table 17 + jinja gating).
-  auto pingpong_supported = [](CutlassTileConfigSM120 t) {
-    return t == CutlassTileConfigSM120::CtaShape128x16x64B ||
-           t == CutlassTileConfigSM120::CtaShape128x16x128B ||
-           t == CutlassTileConfigSM120::CtaShape128x32x64B ||
-           t == CutlassTileConfigSM120::CtaShape128x32x128B ||
-           t == CutlassTileConfigSM120::CtaShape128x64x64B ||
-           t == CutlassTileConfigSM120::CtaShape128x64x128B ||
-           t == CutlassTileConfigSM120::CtaShape128x128x64B ||
-           t == CutlassTileConfigSM120::CtaShape128x128x128B;
-  };
-
-  // Generate configs for {Cooperative, Pingpong (when supported)} x {DP, StreamK} x {swap_ab}.
-  // StreamK is only emitted for the cooperative mainloop: StreamK is incompatible with Pingpong,
-  // so a (Pingpong + StreamK) config has no corresponding kernel and would either fail to link
-  // or silently fall back to cooperative StreamK (a duplicate of the cooperative config).
-  auto emit_for_schedule = [&](CutlassTileConfigSM120 tile_config, MainloopScheduleType mainloop,
-                               bool emit_stream_k) {
-    // Default DP scheduler (use_stream_k = false)
-    candidateConfigs.push_back(CutlassGemmConfig(tile_config, mainloop,
+  // Generate configs for {DP, StreamK} x {swap_ab}, all on the Cooperative mainloop.
+  // The Pingpong mainloop was removed for SM120 NVFP4 (negligible/negative value vs Cooperative
+  // in benchmarks, and it inflated the autotuner search space + mis-selection risk).
+  for (auto const& tile_config : tilesSm120) {
+    // DP scheduler (use_stream_k = false)
+    candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
                                                  EpilogueScheduleType::AUTO, clusterShape, true,
                                                  false));
-    candidateConfigs.push_back(CutlassGemmConfig(tile_config, mainloop,
+    candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
                                                  EpilogueScheduleType::AUTO, clusterShape, false,
                                                  false));
-    if (emit_stream_k) {
-      // StreamK scheduler (use_stream_k = true) - better for small M/N, large K
-      candidateConfigs.push_back(CutlassGemmConfig(tile_config, mainloop,
-                                                   EpilogueScheduleType::AUTO, clusterShape, true,
-                                                   true));
-      candidateConfigs.push_back(CutlassGemmConfig(tile_config, mainloop,
-                                                   EpilogueScheduleType::AUTO, clusterShape, false,
-                                                   true));
-    }
-  };
-
-  for (auto const& tile_config : tilesSm120) {
-    // Cooperative mainloop (encoded as AUTO to stay compatible with prior tactic indices for
-    // existing tiles; the dispatcher routes anything != PINGPONG to the cooperative kernel).
-    // StreamK is emitted only here, alongside the cooperative schedule.
-    emit_for_schedule(tile_config, MainloopScheduleType::AUTO, /*emit_stream_k=*/true);
-    // Pingpong mainloop, only where the jinja emitted the pingpong kernels.  DP only (no StreamK).
-    if (pingpong_supported(tile_config)) {
-      emit_for_schedule(tile_config, MainloopScheduleType::PINGPONG, /*emit_stream_k=*/false);
-    }
+    // StreamK scheduler (use_stream_k = true) - better for small M/N, large K
+    candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
+                                                 EpilogueScheduleType::AUTO, clusterShape, true,
+                                                 true));
+    candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
+                                                 EpilogueScheduleType::AUTO, clusterShape, false,
+                                                 true));
   }
   return candidateConfigs;
 }
