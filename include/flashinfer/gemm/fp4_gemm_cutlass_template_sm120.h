@@ -44,8 +44,7 @@ namespace flashinfer {
 namespace gemm {
 using namespace cute;
 
-// UseStreamK: false = DP scheduler (default), true = StreamK scheduler.
-// SM120 NVFP4 uses the Cooperative mainloop.
+// UseStreamK: false = DP scheduler (default), true = StreamK scheduler
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, bool SwapAB,
           bool UseStreamK = false>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const* B,
@@ -88,15 +87,14 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm120(T* D, void const* A, void const*
  * \param occupancy Optional pointer to store kernel occupancy
  * \return Size of workspace required in bytes
  */
-// Helper macro to dispatch tile config with scheduler / swap_ab selection.
+// Helper macro to dispatch tile config with scheduler selection
 #define DISPATCH_TILE_CONFIG(CTA_M, CTA_N, CTA_K, SWAP_AB, USE_STREAMK)                     \
   return dispatchNVFP4xNVFP4GemmClusterShapeSm120<T, cute::Int<CTA_M>, cute::Int<CTA_N>,    \
                                                   cute::Int<CTA_K>, SWAP_AB, USE_STREAMK>(  \
       D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace, \
       workspaceBytes, stream, occupancy)
 
-// Dispatch with {StreamK, DP} x {swap_ab} scheduler selection.  SM120 NVFP4 uses the
-// Cooperative mainloop.
+// Helper macro to dispatch with scheduler check
 #define DISPATCH_WITH_SCHEDULER(CTA_M, CTA_N, CTA_K)           \
   if (gemmConfig.use_stream_k) {                               \
     if (gemmConfig.swap_ab) {                                  \
@@ -205,15 +203,17 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   // SM120/SM121 only supports 1x1x1 cluster shape
   ClusterShape clusterShape = ClusterShape::ClusterShape_1x1x1;
 
-  // Generate configs for {DP, StreamK} x {swap_ab}, all on the Cooperative mainloop.
+  // Generate configs for both DP and StreamK schedulers
   for (auto const& tile_config : tilesSm120) {
-    // DP scheduler (use_stream_k = false)
+    // Default DP scheduler (use_stream_k = false)
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
                                                  EpilogueScheduleType::AUTO, clusterShape, true,
                                                  false));
+
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
                                                  EpilogueScheduleType::AUTO, clusterShape, false,
                                                  false));
+
     // StreamK scheduler (use_stream_k = true) - better for small M/N, large K
     candidateConfigs.push_back(CutlassGemmConfig(tile_config, MainloopScheduleType::AUTO,
                                                  EpilogueScheduleType::AUTO, clusterShape, true,

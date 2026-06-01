@@ -68,7 +68,6 @@ def b12x_fused_moe(
     *,
     w1_alpha: torch.Tensor,
     w2_alpha: torch.Tensor,
-    fc1_input_scale: Optional[torch.Tensor] = None,
     fc2_input_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
     output: Optional[torch.Tensor] = None,
@@ -173,7 +172,6 @@ def b12x_fused_moe(
         w1_weight=w1_weight,
         w1_weight_sf=w1_weight_sf,
         w1_alpha=w1_alpha,
-        fc1_input_scale=fc1_input_scale,
         fc2_input_scale=fc2_input_scale,
         w2_weight=w2_weight,
         w2_weight_sf=w2_weight_sf,
@@ -395,7 +393,6 @@ class B12xMoEWrapper:
         *,
         w1_alpha: torch.Tensor,
         w2_alpha: torch.Tensor,
-        fc1_input_scale: Optional[torch.Tensor] = None,
         fc2_input_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run MoE computation.
@@ -408,12 +405,8 @@ class B12xMoEWrapper:
             w2_weight_sf: Scale factors for w2_weight.
             token_selected_experts: Expert assignments [num_tokens, top_k].
             token_final_scales: Routing weights [num_tokens, top_k].
-            w1_alpha: Per-expert FC1 output dequant scale.
-            w2_alpha: Per-expert FC2 output dequant scale.
-            fc1_input_scale: Per-expert FC1 input quant scale (forward form,
-                i.e., not reciprocal). Defaults to w1_alpha for back-compat,
-                which is only correct when the FC1 input scale and output
-                dequant scale are equal (e.g., synthetic all-ones tests).
+            w1_alpha: Per-expert global scale for FC1.
+            w2_alpha: Per-expert global scale for FC2.
             fc2_input_scale: Global scale for FC2 input quantization. Required
                 for quant_mode="nvfp4"; accepted but ignored for "w4a16".
 
@@ -503,7 +496,6 @@ class B12xMoEWrapper:
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
-            fc1_input_scale=fc1_input_scale,
             fc2_input_scale=fc2_input_scale,
             w2_weight=w2_weight,
             w2_weight_sf=w2_weight_sf,
