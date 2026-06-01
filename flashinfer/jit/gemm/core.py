@@ -211,6 +211,8 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         dtype_list = ["__nv_bfloat16", "half"]
         # SM120/121 tile configurations with implied 1x1x1 cluster shape
         cta_m_n_k_list = [
+            (128, 8, 128),
+            (128, 8, 256),
             (128, 16, 128),
             (128, 16, 256),
             (128, 32, 128),
